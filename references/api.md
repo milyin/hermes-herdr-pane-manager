@@ -1,6 +1,6 @@
-# Herdr pane manager: caller API v1
+# Hermes Herdr Pane Manager: caller API v1
 
-Invoke `python3 <skill-directory>/scripts/pane_manager.py OPERATION --instance SESSION --workspace WORKSPACE_ID ...` as an argument vector, not a concatenated shell string. `--instance` names an already running local Herdr session, including `default` if intended. Workspace and pane IDs are exact, server-issued values; a pane is identified by the whole `(instance, workspace_id, pane_id)` tuple. The helper never starts or switches sessions. Requires Python 3.10+, `/bin/sh`, `herdr` on `PATH`, and a local Herdr socket at protocol 22. Tested on Linux with Herdr 0.9.1. Remote machine profiles and other protocol versions are not supported.
+Invoke `python3 <skill-directory>/scripts/pane_manager.py OPERATION --instance SESSION --workspace WORKSPACE_ID ...` as an argument vector, not a concatenated shell string. `--instance` names an already running local Herdr session, including `default` if intended. Workspace and pane IDs are exact, server-issued values; a pane is identified by the whole `(instance, workspace_id, pane_id)` tuple. The helper never starts or switches sessions. Requires Python 3.10+, `/bin/sh`, `herdr` on `PATH`, and a local Herdr socket at protocol 22. Tested on Linux with Herdr 0.9.5. Remote machine profiles and other protocol versions are not supported.
 
 | Operation | Additional options | Result fields |
 |---|---|---|
