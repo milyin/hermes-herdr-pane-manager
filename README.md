@@ -1,4 +1,4 @@
-# Herdr Pane Manager
+# Hermes Herdr Pane Manager
 
 A portable [Agent Skill](https://agentskills.io/) and Python CLI for managing local Herdr panes. It creates and groups panes, sends literal text, reads terminal snapshots, renames and closes panes, checks user locks, and exports the layout as JSON or HTML. The caller supplies the application, working directory, and input. No Hermes-specific tool is required by the CLI.
 
@@ -9,15 +9,15 @@ You need Python 3.10 or newer, `/bin/sh`, and a local [Herdr](https://herdr.dev/
 For Hermes, clone the repository into the active profile's skills directory. In a shell with the profile's `HERMES_HOME` set (or unset for the default profile):
 
 ```sh
-skill_dir="${HERMES_HOME:-$HOME/.hermes}/skills/herdr-pane-manager"
+skill_dir="${HERMES_HOME:-$HOME/.hermes}/skills/hermes-herdr-pane-manager"
 mkdir -p "$(dirname "$skill_dir")"
-git clone https://github.com/milyin/herdr-pane-manager.git "$skill_dir"
+git clone https://github.com/milyin/hermes-herdr-pane-manager.git "$skill_dir"
 python3 "$skill_dir/scripts/pane_manager.py" --help
 ```
 
 Start a new agent session to discover the skill. If the destination already contains a manual installation, back it up and move it aside before cloning. To update a Git installation, run `git -C "$skill_dir" pull --ff-only`.
 
-For another Agent Skills-compatible agent, clone the repository as `herdr-pane-manager` into that agent's configured skills directory. Keep `SKILL.md`, `scripts/`, and `references/` together; installing only `SKILL.md` does not install the CLI. To use the CLI without an agent, clone it anywhere and invoke `python3 scripts/pane_manager.py` from the checkout.
+For another Agent Skills-compatible agent, clone the repository as `hermes-herdr-pane-manager` into that agent's configured skills directory. Keep `SKILL.md`, `scripts/`, and `references/` together; installing only `SKILL.md` does not install the CLI. To use the CLI without an agent, clone it anywhere and invoke `python3 scripts/pane_manager.py` from the checkout.
 
 ## Use
 
