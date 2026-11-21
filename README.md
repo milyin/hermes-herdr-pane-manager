@@ -4,7 +4,7 @@ A portable [Agent Skill](https://agentskills.io/) and Python CLI for managing lo
 
 ## Install
 
-You need Python 3.10 or newer, `/bin/sh`, and a local [Herdr](https://herdr.dev/) installation on `PATH`. The CLI requires socket protocol 22; the tested release is [Herdr 0.9.1](https://github.com/herdrdev/herdr/releases/tag/v0.9.1). Start the intended Herdr session before using the CLI. The CLI does not start servers, and remote Herdr instances are not supported.
+You need Python 3.10 or newer, `/bin/sh`, and a local [Herdr](https://herdr.dev/) installation on `PATH`. The CLI requires socket protocol 22; the tested release is [Herdr 0.9.5](https://github.com/herdrdev/herdr/releases/tag/v0.9.5). Start the intended Herdr session before using the CLI. The CLI does not start servers, and remote Herdr instances are not supported.
 
 For Hermes, clone the repository into the active profile's skills directory. In a shell with the profile's `HERMES_HOME` set (or unset for the default profile):
 

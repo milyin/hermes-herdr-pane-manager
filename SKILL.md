@@ -1,7 +1,7 @@
 ---
 name: herdr-pane-manager
 description: Use when managing Herdr panes for any application.
-compatibility: Python 3.10+, POSIX, and a running local Herdr session with socket protocol 22 (tested on Herdr 0.9.1).
+compatibility: Python 3.10+, POSIX, and a running local Herdr session with socket protocol 22 (tested on Herdr 0.9.5).
 metadata:
   version: "0.1.0"
 ---
