@@ -23,9 +23,19 @@ git clone https://github.com/milyin/hermes-herdr-pane-manager.git $skillDir
 python (Join-Path $skillDir 'scripts/pane_manager.py') --help
 ```
 
-Start a new agent session to discover the skill. If the destination already contains a manual installation, back it up and move it aside before cloning. To update a Git installation, run `git pull --ff-only` from the skill directory.
+If the destination already contains a manual installation, back it up and move it aside before cloning. To update a Git installation, run `git pull --ff-only` from the skill directory.
 
 For another Agent Skills-compatible agent, clone the repository as `hermes-herdr-pane-manager` into that agent's configured skills directory. Keep `SKILL.md`, `scripts/`, and `references/` together; installing only `SKILL.md` does not install the CLI. To use the CLI without an agent, clone it anywhere and invoke `python scripts/pane_manager.py` from the checkout.
+
+### Prevent local edits by Hermes
+
+After cloning and before first use, lock the skill in the same Hermes profile where you installed it. Replace `PROFILE_NAME` with that profile's name:
+
+```sh
+hermes -p PROFILE_NAME curator lock hermes-herdr-pane-manager
+```
+
+If you use the default profile, omit `-p PROFILE_NAME`. The lock keeps the skill usable while preventing Hermes from editing its files during normal use or background review. It is a [Hermes policy lock](https://hermes-agent.nousresearch.com/docs/user-guide/features/curator#locking-a-skill), not a filesystem lock, so you can still update the checkout yourself with Git. Cloning the repository does not apply the lock; run the command separately, then start a new agent session to discover the skill.
 
 ## Use
 
