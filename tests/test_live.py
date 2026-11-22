@@ -1,4 +1,5 @@
 """Exercise the shipped CLI on two isolated, headless Herdr servers."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -108,7 +109,7 @@ class Live(unittest.TestCase):
         return self.call('workspace-create', '--label', label, '--cwd', str(self.cwd), *flags,
                          session=session, **kwargs)
 
-    def create(self, suffix, group='test', *, argv=None, stdin=False, cmd=None, app_cwd=None, **kwargs):
+    def create(self, suffix, group='test', *, argv=None, stdin=False, cmd=None, app_cwd=None, config=None, **kwargs):
         if cmd is not None:
             args = ['--command', cmd]
         else:
@@ -116,6 +117,8 @@ class Live(unittest.TestCase):
             args = ['--argv-stdin'] if stdin else ['--argv', payload]
             if stdin:
                 kwargs['stdin'] = payload
+        if config is not None:
+            args += ['--config', str(config)]
         return self.call('create', '--cwd', str(app_cwd or self.cwd), '--group', group, '--suffix', suffix, *args,
                          **kwargs)['pane_id']
 
@@ -144,6 +147,61 @@ class Live(unittest.TestCase):
         self.assertTrue(any(p['pane_id'] == pane for t in layout['tabs'] for p in t['panes']))
         self.new_workspace(PRIMARY, name, code='workspace_exists')
         self.assertNotIn(name, [w['label'] for w in self.call('workspaces', session=SECONDARY)['workspaces']])
+
+    def layout_config(self, rows, cols):
+        config = self.root / f'layout-{rows}-{cols}.json'
+        config.write_text(json.dumps({'layout': {'max_rows': rows, 'max_cols': cols}}), encoding='utf-8')
+        return config
+
+    def group_rectangles(self, group):
+        return [[pane['rect'] for pane in tab['panes']] for tab in self.call('layout')['tabs']
+                if tab['label'] == f'pane-manager: {group}']
+
+    def test_configured_layout_limits_enforce_each_axis_and_overflow(self):
+        for rows, cols in ((1, 1), (1, 2), (2, 1)):
+            with self.subTest(rows=rows, cols=cols):
+                group = f'limits-{rows}-{cols}'
+                config = self.layout_config(rows, cols)
+                for i in range(rows * cols + 1):
+                    self.create(f'app-{i}', group=group, config=config)
+                tabs = self.group_rectangles(group)
+                self.assertEqual(sorted(map(len, tabs)), [1, rows * cols])
+                full = max(tabs, key=len)
+                self.assertEqual(len({r['x'] for r in full}), cols)
+                self.assertEqual(len({r['y'] for r in full}), rows)
+
+    def test_default_layout_limits_allow_four_but_not_a_third_row_or_column(self):
+        group = 'default-limits'
+        for i in range(5):
+            self.create(f'app-{i}', group=group, cli_cwd=self.cwd)
+        tabs = self.group_rectangles(group)
+        self.assertEqual(sorted(map(len, tabs)), [1, 4])
+        for tab in tabs:
+            for axis, span in (('x', 'width'), ('y', 'height')):
+                self.assertLessEqual(max(sum(rect[axis] <= start[axis] < rect[axis] + rect[span] for rect in tab)
+                                         for start in tab), 2)
+
+    def test_concurrent_creates_respect_the_same_tab_limit(self):
+        group = 'parallel'
+        config = self.layout_config(1, 2)
+        self.create('existing', group=group, config=config)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            panes = list(pool.map(lambda i: self.create(f'parallel-{i}', group=group, config=config), range(4)))
+        sizes = [len(tab) for tab in self.group_rectangles(group)]
+        self.assertEqual(sum(sizes), 1 + len(panes))
+        self.assertLessEqual(max(sizes), 2)
+
+    def test_invalid_layout_config_refuses_create_without_launching(self):
+        invalid = self.root / 'invalid-layout.json'
+        before = self.call('layout')
+        for content in ('{"layout":', '{"layout":{"max_rows":true,"max_cols":2}}',
+                        '{"layout":{"max_rows":0,"max_cols":2}}', '{"layout":{"max_cols":2}}'):
+            with self.subTest(content=content):
+                invalid.write_text(content, encoding='utf-8')
+                self.call('create', '--cwd', str(self.cwd), '--group', 'invalid', '--suffix', 'invalid',
+                          '--argv', json.dumps([sys.executable, '-V']), '--config', str(invalid),
+                          code='invalid_config')
+                self.assertEqual(self.call('layout'), before)
 
     def test_create_launch_group_and_preserve_focus(self):
         self.new_workspace(PRIMARY, 'focused workspace', '--focus')
