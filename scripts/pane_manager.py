@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Application-neutral CLI over the local Herdr socket API."""
 import argparse
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+import errno
 import html
 import json
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import NamedTuple
 import unicodedata
 import uuid
 
@@ -23,6 +25,7 @@ MAX_PAGE = 200
 MAX_TAIL = 2000
 FRAME_LIMIT = 8 * 1024 * 1024
 ARGV_JSON_LIMIT = 160 * 1024
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / 'assets' / 'config.json'
 # Request an identification-only token; a pipe server need not impersonate this client.
 PIPE_SECURITY_FLAGS = 0x00100000 | 0x00010000  # SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
 # Preserve output without opening a command interpreter after the app exits.
@@ -57,6 +60,103 @@ class Failure(Exception):
 def require(condition, code, message):
     if not condition:
         raise Failure(code, message)
+
+
+class LayoutLimits(NamedTuple):
+    max_rows: int
+    max_cols: int
+
+
+def load_layout_limits(path):
+    try:
+        config = json.loads(path.expanduser().read_text(encoding='utf-8-sig'))
+    except (OSError, RuntimeError, ValueError) as e:
+        raise Failure('invalid_config', f'Could not read layout config as UTF-8 JSON: {path}') from e
+    layout = config.get('layout') if isinstance(config, dict) else None
+    if not isinstance(layout, dict) or set(layout) != {'max_rows', 'max_cols'}:
+        raise Failure('invalid_config', 'Config must contain layout.max_rows and layout.max_cols')
+    rows, cols = layout['max_rows'], layout['max_cols']
+    require(all(type(value) is int and value > 0 for value in (rows, cols)),
+            'invalid_config', 'layout.max_rows and layout.max_cols must be positive integers')
+    return LayoutLimits(rows, cols)
+
+
+@contextmanager
+def layout_lock(endpoint):
+    # One lock per endpoint, regardless of the config or workspace supplied by
+    # the caller. Never unlink it: another process may already have it open.
+    path = endpoint.with_name(endpoint.name + '.pane-manager-layout.lock')
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    except OSError as e:
+        raise Failure('layout_lock_unavailable', 'Could not open the layout lock; pane kept in its own tab') from e
+    with os.fdopen(fd, 'r+b') as stream:
+        require(stat.S_ISREG(os.fstat(fd).st_mode), 'layout_lock_unavailable', 'Layout lock is not a regular file')
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+
+                    stream.seek(0)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK) or time.monotonic() >= deadline:
+                    raise Failure('layout_lock_unavailable', 'Could not acquire the layout lock; pane kept in its own tab') from e
+                time.sleep(.05)
+        yield
+
+
+def max_crossings(spans, window=None):
+    """Most panes a scanline crosses, optionally inside a target pane's span."""
+    edges = {}
+    for start, end in spans:
+        if window is not None:
+            start, end = max(start, window[0]), min(end, window[1])
+        if start < end:
+            edges[start] = edges.get(start, 0) + 1
+            edges[end] = edges.get(end, 0) - 1
+    count = peak = 0
+    for edge in sorted(edges):
+        count += edges[edge]
+        peak = max(peak, count)
+    return peak
+
+
+def pane_rectangles(view, member_ids):
+    """Return complete, usable geometry or fail closed on an unknown layout."""
+    rectangles = {}
+    for row in objects(view.get('panes')):
+        pane_id, rect = row.get('pane_id'), row.get('rect')
+        if not isinstance(pane_id, str) or pane_id not in member_ids or pane_id in rectangles or not isinstance(rect, dict):
+            return {}
+        x, y, w, h = (rect.get(field) for field in ('x', 'y', 'width', 'height'))
+        if not (type(x) is int and type(y) is int and type(w) is int and type(h) is int and w > 0 and h > 0):
+            return {}
+        rectangles[pane_id] = (x, y, w, h)
+    return rectangles if rectangles.keys() == member_ids else {}
+
+
+def group_options(rectangles, limits):
+    x_spans = [(x, x + w) for x, _, w, _ in rectangles.values()]
+    y_spans = [(y, y + h) for _, y, _, h in rectangles.values()]
+    if max_crossings(x_spans) > limits.max_rows or max_crossings(y_spans) > limits.max_cols:
+        return []
+    options = []
+    for pane_id, (x, y, w, h) in rectangles.items():
+        # A split right adds one column along its y-span; a split down adds
+        # one row along its x-span. The perpendicular span is unchanged.
+        right = w >= 48 and max_crossings(y_spans, (y, y + h)) < limits.max_cols
+        down = h >= 16 and max_crossings(x_spans, (x, x + w)) < limits.max_rows
+        if right or down:
+            direction = 'right' if right and (not down or w >= 3 * h) else 'down'
+            options.append((w * h, pane_id, direction))
+    return options
 
 
 def obj(value):
@@ -294,6 +394,7 @@ def workspace_create(transport, name, cwd, focus):
 class Manager:
     def __init__(self, transport, workspace):
         self.rpc = transport.request
+        self.endpoint = transport.path
         self.workspace = workspace
 
     def snapshot(self):
@@ -337,7 +438,7 @@ class Manager:
                 require(not view['zoomed'], 'tab_user_locked', 'Changing this tab could disturb a zoomed pane')
         return row, locked
 
-    def create(self, command, cwd, group, suffix, argv=None):
+    def create(self, command, cwd, group, suffix, argv=None, *, limits):
         label(group, 'group')
         label(suffix, 'suffix', allow_empty=True)
         absolute_cwd(cwd)
@@ -376,13 +477,16 @@ class Manager:
                           pane_id=pane_id, cause=e.data['code']) from e
         # Grouping is optional. A standalone tab still satisfies a successful create.
         try:
-            grouped = self.group(pane_id, tab_id, tab_label)
+            grouped = 'standalone'
+            if limits.max_rows * limits.max_cols > 1:
+                with layout_lock(self.endpoint):
+                    grouped = self.group(pane_id, tab_id, tab_label, limits)
         except Failure as e:
             return dict(pane_id=pane_id, label=self.name(pane_id, suffix), grouping='unconfirmed',
                         grouping_error=e.data['code'])
         return dict(pane_id=pane_id, label=self.name(pane_id, suffix), grouping=grouped)
 
-    def group(self, pane_id, source_tab, tab_label):
+    def group(self, pane_id, source_tab, tab_label, limits):
         snap = self.snapshot()
         source, _ = self.guard(snap, pane_id, writable=True, rearranges=True)
         require(source.get('tab_id') == source_tab, 'scope_mismatch', 'New pane changed tabs before grouping')
@@ -392,7 +496,7 @@ class Manager:
             if tab_id == source_tab or tab.get('label') != tab_label:
                 continue
             members = [p for p in snap['panes'] if p.get('tab_id') == tab_id]
-            if not (1 <= len(members) < 4):
+            if not (1 <= len(members) < limits.max_rows * limits.max_cols):
                 continue
             # Don't split arbitrary user panes in a tab renamed to match a group.
             if any(not isinstance(p.get('label'), str) or not p['label'].startswith(string(p.get('pane_id')) + ' ')
@@ -401,15 +505,8 @@ class Manager:
             view = self.view(snap, tab_id)
             if view['zoomed']:
                 continue
-            options = []
             member_ids = {p['pane_id'] for p in members}
-            for row in objects(view.get('panes')):
-                target = string(row.get('pane_id'))
-                rect = obj(row.get('rect'))
-                w, h = rect.get('width'), rect.get('height')
-                if target in member_ids and type(w) is int and type(h) is int and (w >= 48 or h >= 16):
-                    direction = 'right' if w >= 48 and (w >= 3*h or h < 16) else 'down'
-                    options.append((w*h, target, direction))
+            options = group_options(pane_rectangles(view, member_ids), limits)
             if not options:
                 continue
             _, target, direction = max(options)
@@ -554,6 +651,7 @@ def parser():
         if op not in ('create', 'layout'):
             sub.add_argument('--pane', required=True, help='exact Herdr pane ID')
         if op == 'create':
+            sub.add_argument('--config', type=Path, default=DEFAULT_CONFIG, help='layout JSON file (default: bundled assets/config.json)')
             command = sub.add_mutually_exclusive_group(required=True)
             command.add_argument('--command', help='POSIX shell command line')
             command.add_argument('--argv', type=json.loads, help='JSON argument vector')
@@ -581,6 +679,7 @@ def main():
     # The machine-readable CLI is UTF-8 regardless of the host console code page.
     sys.stdout.reconfigure(encoding='utf-8')
     try:
+        limits = load_layout_limits(a.config) if a.operation == 'create' else None
         transport = Transport(a.instance)
         if a.operation == 'workspaces':
             result = dict(instance=a.instance, workspaces=list_workspaces(transport))
@@ -609,7 +708,7 @@ def main():
                 except (ValueError, UnicodeError) as e:
                     raise Failure('invalid_argument', 'Expected a UTF-8 JSON argument array') from e
             require(a.command is not None or argv is not None, 'invalid_argument', 'Expected a JSON argument array')
-            result = manager.create(a.command, a.cwd, a.group, a.suffix, argv)
+            result = manager.create(a.command, a.cwd, a.group, a.suffix, argv, limits=limits)
         elif a.operation == 'send':
             text = sys.stdin.buffer.read(65537).decode('utf-8') if a.stdin else a.text
             result = manager.send(a.pane, text)

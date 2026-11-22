@@ -25,7 +25,7 @@ python (Join-Path $skillDir 'scripts/pane_manager.py') --help
 
 If the destination already contains a manual installation, back it up and move it aside before cloning. To update a Git installation, run `git pull --ff-only` from the skill directory.
 
-For another Agent Skills-compatible agent, clone the repository as `hermes-herdr-pane-manager` into that agent's configured skills directory. Keep `SKILL.md`, `scripts/`, and `references/` together; installing only `SKILL.md` does not install the CLI. To use the CLI without an agent, clone it anywhere and invoke `python scripts/pane_manager.py` from the checkout.
+For another Agent Skills-compatible agent, clone the repository as `hermes-herdr-pane-manager` into that agent's configured skills directory. Keep `SKILL.md`, `scripts/`, `references/`, and `assets/` together; installing only `SKILL.md` does not install the CLI. To use the CLI without an agent, clone it anywhere and invoke `python scripts/pane_manager.py` from the checkout.
 
 ### Prevent local edits by Hermes
 
@@ -63,6 +63,21 @@ The pipe avoids Windows shell quoting problems when passing JSON; for non-ASCII 
 `create` returns the pane ID for `send`, `read`, `rename`, `lock-status`, and `close`. See [the caller API](references/api.md) for arguments, paging, and response formats.
 
 A zoomed pane stays readable but rejects input, renaming, and closing. The CLI never unzooms a pane. Herdr protocol 22 has no atomic check-and-mutate operation, so a simultaneous zoom change can race a mutation. This guard applies only to calls through this CLI.
+
+## Layout configuration
+
+By default, `create` reads [assets/config.json](assets/config.json), which allows up to two rows and two columns per tab (at most four panes). Set both limits to positive integers. For example, this config allows two side-by-side panes but no vertical stacking:
+
+```json
+{
+  "layout": {
+    "max_rows": 1,
+    "max_cols": 2
+  }
+}
+```
+
+To customize the limits, copy the config outside the skill checkout and pass `--config PATH` to `create`. Use the same config for all calls that manage a given workspace. When no same-group tab can accept another pane within the limits, the new pane stays in a separate tab. Changing the config does not rearrange existing panes or restrict manual splits in Herdr.
 
 ## Tests and CI
 
