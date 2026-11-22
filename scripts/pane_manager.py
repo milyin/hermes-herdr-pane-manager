@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Application-neutral CLI over the local Herdr socket API."""
 import argparse
+from contextlib import suppress
 import html
 import json
 import os
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import uuid
 
@@ -20,8 +22,30 @@ GROUP_PREFIX = 'pane-manager: '
 MAX_PAGE = 200
 MAX_TAIL = 2000
 FRAME_LIMIT = 8 * 1024 * 1024
+ARGV_JSON_LIMIT = 160 * 1024
+# Request an identification-only token; a pipe server need not impersonate this client.
+PIPE_SECURITY_FLAGS = 0x00100000 | 0x00010000  # SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
 # Preserve output without opening a command interpreter after the app exits.
 LAUNCH = '/bin/sh -c "$1"; rc=$?; printf "\\n[pane-manager] command exited: %s\\n" "$rc"; while IFS= read -r _; do :; done'
+ARGV_LAUNCH = '''import subprocess, sys
+try:
+    child = subprocess.Popen(sys.argv[1:])
+except OSError as exc:
+    print(f'[pane-manager] Could not launch command: {exc}', flush=True)
+    rc = 127
+else:
+    while True:
+        try:
+            rc = child.wait()
+            break
+        except KeyboardInterrupt:
+            # The terminal also sends Ctrl+C to the foreground application.
+            # Do not kill an application that handles it and keeps running.
+            continue
+print(f'\\n[pane-manager] command exited: {rc}', flush=True)
+for _ in sys.stdin:
+    pass
+'''
 
 
 class Failure(Exception):
@@ -57,10 +81,60 @@ def label(value, name, *, allow_empty=False):
     return value
 
 
+def windows_find_on_path(name):
+    # Avoid shutil.which's implicit Windows current-directory search. Relative
+    # PATH entries are also relative to the caller's current directory.
+    for item in os.environ.get('PATH', '').split(os.pathsep):
+        directory = Path(item.strip('"'))
+        if directory.is_absolute():
+            path = directory / name
+            if path.is_file():
+                return str(path)
+    return None
+
+
+def windows_program(program, cwd):
+    path = Path(program)
+    if not path.suffix:
+        path = path.with_suffix('.exe')
+    require(path.suffix.lower() in ('.exe', '.com'), 'invalid_argument',
+            'Windows --argv requires an .exe or .com program, not a batch file; invoke an explicit shell if needed')
+    if path.is_absolute():
+        return str(path)
+    if path.anchor:
+        raise Failure('invalid_argument', 'Use a fully qualified Windows executable path')
+    if path.name == program or path.name == program + '.exe':
+        resolved = windows_find_on_path(path.name)
+        require(resolved is not None, 'invalid_argument', 'Program not found on Windows PATH; use an absolute executable path')
+        return resolved
+    # An explicitly relative path is relative to the requested application cwd.
+    return str(Path(cwd) / path)
+
+
+def pipe_io(start, handle, value, deadline):
+    import _winapi
+
+    pending, _ = start(handle, value, overlapped=True)
+    try:
+        left_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        if _winapi.WaitForSingleObject(pending.event, left_ms) != _winapi.WAIT_OBJECT_0:
+            raise TimeoutError('Herdr pipe request timed out')
+        count, error = pending.GetOverlappedResult(False)
+        if error:
+            raise OSError(error, 'Herdr pipe I/O failed')
+        return count, pending
+    except BaseException:
+        with suppress(OSError):
+            pending.cancel()
+        with suppress(OSError):
+            pending.GetOverlappedResult(True)
+        raise
+
+
 class Transport:
     def __init__(self, instance):
         require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', instance), 'invalid_argument', 'Use an explicit local Herdr session name')
-        binary = shutil.which('herdr')
+        binary = windows_find_on_path('herdr.exe') if os.name == 'nt' else shutil.which('herdr')
         require(binary is not None, 'instance_unavailable', 'Cannot find herdr on PATH')
         # An inherited pane/socket must never silently retarget a named session.
         env = {k: v for k, v in os.environ.items() if not k.startswith('HERDR_') or k == 'HERDR_CONFIG_PATH'}
@@ -70,7 +144,10 @@ class Transport:
             status = obj(json.loads(res.stdout))
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             raise Failure('instance_unavailable', 'Could not resolve the named running Herdr session') from e
-        require(status.get('session') == instance and status.get('running') is True and status.get('status') == 'running',
+        # Herdr 0.9.5 reports its reserved default session as JSON null.
+        session_matches = status.get('session') == instance or (
+            instance == 'default' and 'session' in status and status['session'] is None)
+        require(session_matches and status.get('running') is True and status.get('status') == 'running',
                 'instance_unavailable', 'Named Herdr session is not running')
         require(status.get('endpoint_compatible') is True and status.get('protocol') == PROTOCOL,
                 'incompatible_protocol', f'Expected Herdr socket protocol {PROTOCOL}')
@@ -81,25 +158,84 @@ class Transport:
     def socket_identity(self):
         try:
             info = self.path.lstat()
+            if os.name == 'nt':
+                require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 64,
+                        'instance_unavailable', 'Invalid Herdr Windows socket marker')
+                with self.path.open('rb') as stream:
+                    marker = stream.read(65)
+                require(re.fullmatch(rb'[1-9][0-9]{0,9}:[0-9]{1,24}', marker),
+                        'instance_unavailable', 'Invalid Herdr Windows socket marker')
+                return marker
         except OSError as e:
             raise Failure('instance_unavailable', 'Herdr socket disappeared or cannot be inspected') from e
         require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.geteuid(), 'instance_unavailable', 'Herdr socket must be owned by this user')
         return info.st_dev, info.st_ino, info.st_ctime_ns
+
+    def windows_connection(self):
+        import ctypes
+        from ctypes import wintypes
+        import _winapi
+
+        require(self.socket_identity() == self.identity, 'instance_changed', 'Herdr endpoint changed')
+        name = '\\\\.\\pipe\\' + str(self.path)
+        args = (name, _winapi.GENERIC_READ | _winapi.GENERIC_WRITE, 0, 0,
+                _winapi.OPEN_EXISTING, _winapi.FILE_FLAG_OVERLAPPED | PIPE_SECURITY_FLAGS, 0)
+        try:
+            handle = _winapi.CreateFile(*args)
+        except OSError as e:
+            if e.winerror != _winapi.ERROR_PIPE_BUSY:
+                raise
+            _winapi.WaitNamedPipe(name, 1000)
+            handle = _winapi.CreateFile(*args)
+        try:
+            server_pid = wintypes.ULONG()
+            get_pid = ctypes.WinDLL('kernel32', use_last_error=True).GetNamedPipeServerProcessId
+            get_pid.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG))
+            get_pid.restype = wintypes.BOOL
+            require(get_pid(handle, ctypes.byref(server_pid)) and server_pid.value == int(self.identity.split(b':')[0])
+                    and self.socket_identity() == self.identity, 'instance_changed', 'Herdr named pipe does not match the server marker')
+            return handle
+        except BaseException:
+            _winapi.CloseHandle(handle)
+            raise
 
     def request(self, method, *, changes=False, **params):
         token = uuid.uuid4().hex
         frame = (json.dumps(dict(id=token, method=method, params=params)) + '\n').encode()
         attempted = False
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-                conn.settimeout(5)
-                require(self.socket_identity() == self.identity, 'instance_changed', 'Herdr endpoint changed')
-                conn.connect(str(self.path))
-                require(self.socket_identity() == self.identity, 'instance_changed', 'Herdr endpoint changed')
-                attempted = True
-                conn.sendall(frame)
-                with conn.makefile('rb') as reader:
-                    raw = reader.readline(FRAME_LIMIT + 1)
+            if os.name == 'nt':
+                import _winapi
+
+                handle = self.windows_connection()
+                try:
+                    deadline = time.monotonic() + 5
+                    attempted = True
+                    count, _ = pipe_io(_winapi.WriteFile, handle, frame, deadline)
+                    if count != len(frame):
+                        raise ValueError('incomplete request')
+                    raw = bytearray()
+                    while len(raw) <= FRAME_LIMIT:
+                        count, pending = pipe_io(_winapi.ReadFile, handle, 65536, deadline)
+                        if not count:
+                            break
+                        raw.extend(pending.getbuffer())
+                        end = raw.find(b'\n', max(0, len(raw) - count))
+                        if end >= 0:
+                            del raw[end + 1:]
+                            break
+                finally:
+                    _winapi.CloseHandle(handle)
+            else:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                    conn.settimeout(5)
+                    require(self.socket_identity() == self.identity, 'instance_changed', 'Herdr endpoint changed')
+                    conn.connect(str(self.path))
+                    require(self.socket_identity() == self.identity, 'instance_changed', 'Herdr endpoint changed')
+                    attempted = True
+                    conn.sendall(frame)
+                    with conn.makefile('rb') as reader:
+                        raw = reader.readline(FRAME_LIMIT + 1)
             if not raw.endswith(b'\n') or len(raw) > FRAME_LIMIT:
                 raise ValueError('incomplete or oversized reply')
             reply = json.loads(raw)
@@ -116,14 +252,52 @@ class Transport:
             raise Failure(code, f'No verified reply for {method}; inspect state before retrying a mutation') from e
 
 
+def session_snapshot(rpc):
+    snap = obj(rpc('session.snapshot').get('snapshot'))
+    require(snap.get('protocol') == PROTOCOL, 'incompatible_protocol', 'Herdr snapshot protocol changed')
+    return snap
+
+
+def list_workspaces(transport):
+    rows = objects(session_snapshot(transport.request).get('workspaces'))
+    return [dict(workspace_id=string(row.get('workspace_id')), label=row.get('label'),
+                 focused=row.get('focused') is True) for row in rows]
+
+
+def absolute_cwd(cwd):
+    require(Path(cwd).is_absolute() and Path(cwd).is_dir(), 'invalid_argument', 'cwd must be an existing absolute local directory')
+
+
+def workspace_create(transport, name, cwd, focus):
+    label(name, 'workspace label')
+    absolute_cwd(cwd)
+    rpc = transport.request
+    before = objects(session_snapshot(rpc).get('workspaces'))
+    require(not any(row.get('label') == name for row in before), 'workspace_exists', 'Workspace label already exists')
+    created = rpc('workspace.create', changes=True, cwd=cwd, label=name, focus=focus, env={})
+    workspace_id = None
+    try:
+        workspace_id = string(obj(created.get('workspace')).get('workspace_id'))
+        require(workspace_id not in {row.get('workspace_id') for row in before}, 'scope_mismatch', 'Expected a new workspace ID')
+        pane_id = string(obj(created.get('root_pane')).get('pane_id'))
+        snap = session_snapshot(rpc)
+        workspace = Manager.select(objects(snap.get('workspaces')), 'workspace_id', workspace_id, 'workspace_not_found')
+        root = Manager.select(objects(snap.get('panes')), 'pane_id', pane_id, 'pane_not_found')
+        require(workspace.get('label') == name and root.get('workspace_id') == workspace_id,
+                'scope_mismatch', 'Workspace label or root pane could not be confirmed')
+    except Failure as e:
+        raise Failure('outcome_unknown', 'Workspace creation was acknowledged but not verified; do not retry blindly',
+                      workspace_id=workspace_id, cause=e.data['code']) from e
+    return dict(workspace_id=workspace_id, label=name, root_pane_id=pane_id)
+
+
 class Manager:
     def __init__(self, transport, workspace):
         self.rpc = transport.request
         self.workspace = workspace
 
     def snapshot(self):
-        snap = obj(self.rpc('session.snapshot').get('snapshot'))
-        require(snap.get('protocol') == PROTOCOL, 'incompatible_protocol', 'Herdr snapshot protocol changed')
+        snap = session_snapshot(self.rpc)
         matching = lambda row: row.get('workspace_id') == self.workspace
         require(sum(map(matching, objects(snap.get('workspaces')))) == 1, 'workspace_not_found', 'Workspace ID is not present in this instance')
         return {key: [row for row in objects(snap.get(key)) if matching(row)]
@@ -163,17 +337,33 @@ class Manager:
                 require(not view['zoomed'], 'tab_user_locked', 'Changing this tab could disturb a zoomed pane')
         return row, locked
 
-    def create(self, command, cwd, group, suffix):
+    def create(self, command, cwd, group, suffix, argv=None):
         label(group, 'group')
         label(suffix, 'suffix', allow_empty=True)
-        require(command.strip() and '\0' not in command and len(command.encode()) <= 32768,
-                'invalid_argument', 'Expected a nonempty command line of at most 32 KiB')
-        require(Path(cwd).is_absolute() and Path(cwd).is_dir(), 'invalid_argument', 'cwd must be an existing absolute local directory')
+        absolute_cwd(cwd)
+        if argv is not None:
+            require(isinstance(argv, list) and bool(argv) and bool(argv[0]) and all(
+                isinstance(part, str) and '\0' not in part for part in argv),
+                'invalid_argument', 'Expected a JSON array with a program name and string arguments')
+            require(sum(len(part.encode()) + 1 for part in argv) <= 24000,
+                    'invalid_argument', 'Argument vector is too long')
+            if os.name == 'nt':
+                argv = [windows_program(argv[0], cwd), *argv[1:]]
+            # Do not import code from the requested application working directory.
+            launch = [sys.executable, '-I', '-u', '-c', ARGV_LAUNCH, *argv]
+            if os.name == 'nt':
+                require(len(subprocess.list2cmdline(launch).encode('utf-16-le')) < 65534,
+                        'invalid_argument', 'Quoted argument vector exceeds the Windows command line limit')
+        else:
+            require(os.name != 'nt', 'invalid_argument', 'Use --argv for native Windows or WSL applications')
+            require(command.strip() and '\0' not in command and len(command.encode()) <= 32768,
+                    'invalid_argument', 'Expected a nonempty command line of at most 32 KiB')
+            launch = ['/bin/sh', '-c', LAUNCH, 'pane-manager', command]
         self.snapshot()  # Never let Herdr choose a workspace implicitly.
         tab_label = GROUP_PREFIX + group
         created = self.rpc('layout.apply', changes=True, workspace_id=self.workspace,
-                           tab_label=tab_label, focus=False, root=dict(type='pane', cwd=cwd,
-                           command=['/bin/sh', '-c', LAUNCH, 'pane-manager', command]))
+                           tab_label=tab_label, focus=False,
+                           root=dict(type='pane', cwd=cwd, command=launch))
         pane_id = None
         try:
             layout = obj(created.get('layout'))
@@ -350,14 +540,24 @@ def write_output(path, contents):
 def parser():
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = p.add_subparsers(dest='operation', required=True)
-    for op in ('create', 'send', 'read', 'rename', 'lock-status', 'close', 'layout'):
+    for op in ('workspaces', 'workspace-create', 'create', 'send', 'read', 'rename', 'lock-status', 'close', 'layout'):
         sub = commands.add_parser(op, allow_abbrev=False)
         sub.add_argument('--instance', required=True, help='explicit local Herdr session name')
+        if op == 'workspaces':
+            continue
+        if op == 'workspace-create':
+            sub.add_argument('--label', required=True)
+            sub.add_argument('--cwd', required=True)
+            sub.add_argument('--focus', action='store_true')
+            continue
         sub.add_argument('--workspace', required=True, help='exact Herdr workspace ID, not a label')
         if op not in ('create', 'layout'):
             sub.add_argument('--pane', required=True, help='exact Herdr pane ID')
         if op == 'create':
-            sub.add_argument('--command', required=True)
+            command = sub.add_mutually_exclusive_group(required=True)
+            command.add_argument('--command', help='POSIX shell command line')
+            command.add_argument('--argv', type=json.loads, help='JSON argument vector')
+            command.add_argument('--argv-stdin', action='store_true', help='read a UTF-8 JSON argument vector from stdin')
             sub.add_argument('--cwd', required=True)
             sub.add_argument('--group', required=True)
         if op in ('create', 'rename'):
@@ -369,7 +569,7 @@ def parser():
         if op == 'read':
             sub.add_argument('--limit', type=int, default=50)
             sub.add_argument('--before', type=int, default=0)
-            sub.add_argument('--source', choices=('detection', 'visible'), default='detection')
+            sub.add_argument('--source', choices=('detection', 'visible', 'recent_unwrapped'), default='detection')
         if op == 'layout':
             sub.add_argument('--format', choices=RENDERERS, default='json')
             sub.add_argument('--output', help='write to this file instead of stdout')
@@ -378,8 +578,19 @@ def parser():
 
 def main():
     a = parser().parse_args()
+    # The machine-readable CLI is UTF-8 regardless of the host console code page.
+    sys.stdout.reconfigure(encoding='utf-8')
     try:
-        manager = Manager(Transport(a.instance), a.workspace)
+        transport = Transport(a.instance)
+        if a.operation == 'workspaces':
+            result = dict(instance=a.instance, workspaces=list_workspaces(transport))
+            print(json_text(dict(ok=True, result=result)))
+            return 0
+        if a.operation == 'workspace-create':
+            result = workspace_create(transport, a.label, a.cwd, a.focus)
+            print(json_text(dict(ok=True, result=result)))
+            return 0
+        manager = Manager(transport, a.workspace)
         if a.operation == 'layout':
             layout = dict(instance=a.instance, **manager.layout())
             rendered = RENDERERS[a.format](layout)
@@ -389,7 +600,16 @@ def main():
             write_output(a.output, rendered)
             result = dict(output=a.output, format=a.format)
         elif a.operation == 'create':
-            result = manager.create(a.command, a.cwd, a.group, a.suffix)
+            argv = a.argv
+            if a.argv_stdin:
+                data = sys.stdin.buffer.read(ARGV_JSON_LIMIT + 1)
+                require(len(data) <= ARGV_JSON_LIMIT, 'invalid_argument', 'JSON argument vector input is too long')
+                try:
+                    argv = json.loads(data.decode('utf-8-sig'))
+                except (ValueError, UnicodeError) as e:
+                    raise Failure('invalid_argument', 'Expected a UTF-8 JSON argument array') from e
+            require(a.command is not None or argv is not None, 'invalid_argument', 'Expected a JSON argument array')
+            result = manager.create(a.command, a.cwd, a.group, a.suffix, argv)
         elif a.operation == 'send':
             text = sys.stdin.buffer.read(65537).decode('utf-8') if a.stdin else a.text
             result = manager.send(a.pane, text)
