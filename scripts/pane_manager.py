@@ -688,7 +688,7 @@ class Manager:
             geometry = {row.get('pane_id'): row.get('rect') for row in objects(view.get('panes'))}
             panes = [dict(pane_id=p['pane_id'], label=p.get('label'), focused=p.get('focused') is True,
                           user_locked=self.locked(view, p['pane_id']), rect=geometry.get(p['pane_id']),
-                          terminal_id=p.get('terminal_id'), cwd=p.get('cwd'),
+                          terminal_id=p.get('terminal_id'),
                           agent_status=p.get('agent_status'), **self.label_parts(p))
                      for p in snap['panes'] if p.get('tab_id') == tab_id]
             tabs.append(dict(tab_id=tab_id, label=tab.get('label'), zoomed=view['zoomed'],
