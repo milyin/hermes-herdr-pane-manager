@@ -21,6 +21,7 @@ import uuid
 
 PROTOCOL = 22
 GROUP_PREFIX = 'pane-manager: '
+STARTING_PREFIX = 'pane-manager-starting: '
 MAX_PAGE = 200
 MAX_TAIL = 2000
 FRAME_LIMIT = 8 * 1024 * 1024
@@ -368,9 +369,11 @@ def absolute_cwd(cwd):
     require(Path(cwd).is_absolute() and Path(cwd).is_dir(), 'invalid_argument', 'cwd must be an existing absolute local directory')
 
 
-def workspace_create(transport, name, cwd, focus):
+def workspace_create(transport, name, cwd, focus, *, group=None):
     label(name, 'workspace label')
     absolute_cwd(cwd)
+    if group is not None:
+        label(group, 'group')
     rpc = transport.request
     before = objects(session_snapshot(rpc).get('workspaces'))
     require(not any(row.get('label') == name for row in before), 'workspace_exists', 'Workspace label already exists')
@@ -385,6 +388,14 @@ def workspace_create(transport, name, cwd, focus):
         root = Manager.select(objects(snap.get('panes')), 'pane_id', pane_id, 'pane_not_found')
         require(workspace.get('label') == name and root.get('workspace_id') == workspace_id,
                 'scope_mismatch', 'Workspace label or root pane could not be confirmed')
+        if group is not None:
+            tab_id = string(root.get('tab_id'))
+            manager = Manager(transport, workspace_id)
+            manager.rename(pane_id, '', expected_tab=tab_id)
+            rpc('tab.rename', changes=True, tab_id=tab_id, label=GROUP_PREFIX + group)
+            tab = manager.select(manager.snapshot()['tabs'], 'tab_id', tab_id, 'tab_not_found')
+            require(tab.get('label') == GROUP_PREFIX + group, 'outcome_unknown',
+                    'Workspace tab group could not be confirmed')
     except Failure as e:
         raise Failure('outcome_unknown', 'Workspace creation was acknowledged but not verified; do not retry blindly',
                       workspace_id=workspace_id, cause=e.data['code']) from e
@@ -438,9 +449,9 @@ class Manager:
                 require(not view['zoomed'], 'tab_user_locked', 'Changing this tab could disturb a zoomed pane')
         return row, locked
 
-    def create(self, command, cwd, group, suffix, argv=None, *, limits):
+    def create(self, command, cwd, group, suffix, argv=None, *, limits, status=None, comment=None):
         label(group, 'group')
-        label(suffix, 'suffix', allow_empty=True)
+        initial = self.label_update(None, suffix, status, comment)
         absolute_cwd(cwd)
         if argv is not None:
             require(isinstance(argv, list) and bool(argv) and bool(argv[0]) and all(
@@ -462,16 +473,18 @@ class Manager:
             launch = ['/bin/sh', '-c', LAUNCH, 'pane-manager', command]
         self.snapshot()  # Never let Herdr choose a workspace implicitly.
         tab_label = GROUP_PREFIX + group
+        root = dict(type='pane', cwd=cwd, command=launch)
+        if status is not None:
+            root['label'] = STARTING_PREFIX + initial
         created = self.rpc('layout.apply', changes=True, workspace_id=self.workspace,
-                           tab_label=tab_label, focus=False,
-                           root=dict(type='pane', cwd=cwd, command=launch))
+                           tab_label=tab_label, focus=False, root=root)
         pane_id = None
         try:
             layout = obj(created.get('layout'))
             require(layout.get('workspace_id') == self.workspace, 'scope_mismatch', 'Herdr created a tab outside the requested workspace')
             pane_id = string(obj(layout.get('root')).get('pane_id'))
             tab_id = string(layout.get('tab_id'))
-            self.rename(pane_id, suffix, expected_tab=tab_id)
+            renamed = self.rename(pane_id, suffix, expected_tab=tab_id, status=status, comment=comment)
         except Failure as e:
             raise Failure('partial_create', 'Herdr launched a pane but its identity or label could not be verified; do not retry blindly',
                           pane_id=pane_id, cause=e.data['code']) from e
@@ -482,9 +495,9 @@ class Manager:
                 with layout_lock(self.endpoint):
                     grouped = self.group(pane_id, tab_id, tab_label, limits)
         except Failure as e:
-            return dict(pane_id=pane_id, label=self.name(pane_id, suffix), grouping='unconfirmed',
+            return dict(renamed, grouping='unconfirmed',
                         grouping_error=e.data['code'])
-        return dict(pane_id=pane_id, label=self.name(pane_id, suffix), grouping=grouped)
+        return dict(renamed, grouping=grouped)
 
     def group(self, pane_id, source_tab, tab_label, limits):
         snap = self.snapshot()
@@ -499,8 +512,7 @@ class Manager:
             if not (1 <= len(members) < limits.max_rows * limits.max_cols):
                 continue
             # Don't split arbitrary user panes in a tab renamed to match a group.
-            if any(not isinstance(p.get('label'), str) or not p['label'].startswith(string(p.get('pane_id')) + ' ')
-                   and p['label'] != p['pane_id'] for p in members):
+            if any(self.label_parts(p)['displayed_id'] is None for p in members):
                 continue
             view = self.view(snap, tab_id)
             if view['zoomed']:
@@ -530,12 +542,49 @@ class Manager:
     def name(pane_id, suffix):
         return f'{pane_id} {suffix}' if suffix else pane_id
 
-    def rename(self, pane_id, suffix, expected_tab=None):
-        label(suffix, 'suffix', allow_empty=True)
-        row, _ = self.guard(self.snapshot(), pane_id, writable=True)
+    @staticmethod
+    def label_parts(row):
+        pane_id = string(row.get('pane_id'))
+        raw = row.get('label')
+        if isinstance(raw, str) and raw.startswith(STARTING_PREFIX):
+            status, _, comment = raw.removeprefix(STARTING_PREFIX).partition(' ')
+            return dict(displayed_id=None, status=status or None, comment=comment,
+                        pending_closure=False, creation_pending=True)
+        head, _, suffix = raw.partition(' ') if isinstance(raw, str) else ('', '', '')
+        dead = head == f'{pane_id}:DEAD'
+        managed = head == pane_id or dead
+        status, _, comment = suffix.partition(' ') if managed else ('', '', '')
+        return dict(displayed_id=head if managed else None, status=status or None,
+                    comment=comment if managed else None, pending_closure=dead, creation_pending=False)
+
+    @classmethod
+    def label_update(cls, row, suffix, status, comment):
+        if suffix is not None:
+            require(status is None and comment is None, 'invalid_argument',
+                    'Use either suffix or status and comment')
+            return label(suffix, 'suffix', allow_empty=True)
+        previous = cls.label_parts(row) if row is not None else {}
+        if status is None:
+            status = previous.get('status')
+        require(isinstance(status, str) and re.fullmatch(r'[A-Za-z0-9_?:-]{1,32}', status),
+                'invalid_argument', 'A structured label needs a short single-token status')
+        comment = previous.get('comment') if comment is None else comment
+        if comment:
+            label(comment, 'comment')
+        return cls.name(status, comment)
+
+    def rename(self, pane_id, suffix=None, expected_tab=None, *, status=None, comment=None):
+        with layout_lock(self.endpoint):
+            row, _ = self.guard(self.snapshot(), pane_id, writable=True)
+            require(expected_tab is None or row.get('tab_id') == expected_tab,
+                    'scope_mismatch', 'Pane changed tabs before labeling')
+            parts = self.label_parts(row)
+            name = self.name(parts['displayed_id'] or pane_id, self.label_update(row, suffix, status, comment))
+            return self.apply_label(row, name)
+
+    def apply_label(self, row, name):
+        pane_id = string(row.get('pane_id'))
         terminal = string(row.get('terminal_id'))
-        require(expected_tab is None or row.get('tab_id') == expected_tab, 'scope_mismatch', 'Pane changed tabs before labeling')
-        name = self.name(pane_id, suffix)
         self.rpc('pane.rename', changes=True, pane_id=pane_id, label=name)
         try:
             renamed = self.pane(self.snapshot(), pane_id)
@@ -543,11 +592,50 @@ class Manager:
                     'outcome_unknown', 'Rename was not confirmed')
         except Failure as e:
             raise Failure('outcome_unknown', 'Rename was acknowledged but not verified', pane_id=pane_id, cause=e.data['code']) from e
-        return dict(pane_id=pane_id, label=name)
+        return dict(pane_id=pane_id, terminal_id=terminal, label=name, **self.label_parts(renamed))
 
-    def close(self, pane_id):
-        self.guard(self.snapshot(), pane_id, writable=True, rearranges=True)
-        self.rpc('pane.close', changes=True, pane_id=pane_id)
+    def defer_close(self, row, reason):
+        pane_id = row['pane_id']
+        parts = self.label_parts(row)
+        require(parts['displayed_id'] is not None, 'invalid_argument', 'Expected a managed pane label')
+        if parts['pending_closure']:
+            receipt = dict(pane_id=pane_id, label=row['label'], **parts)
+        else:
+            receipt = self.apply_label(row, self.name(f'{pane_id}:DEAD', row['label'].partition(' ')[2]))
+        return dict(receipt, closed=False, status_code='close_deferred', reason=reason)
+
+    def close(self, pane_id, *, defer_locked=False):
+        with layout_lock(self.endpoint):
+            snap = self.snapshot()
+            row, locked = self.guard(snap, pane_id)
+            tab = self.view(snap, string(row.get('tab_id')))
+            if tab['zoomed']:
+                reason = 'user_locked' if locked else 'tab_user_locked'
+                if defer_locked:
+                    return self.defer_close(row, reason)
+                raise Failure(reason, 'Closing this pane would disturb a zoomed pane')
+            if defer_locked:
+                try:
+                    self.rpc('pane.close_unzoomed', changes=True, pane_id=pane_id,
+                             terminal_id=row['terminal_id'], workspace_id=self.workspace)
+                except Failure as exc:
+                    reason = exc.data.get('native_code')
+                    if reason in ('user_locked', 'tab_user_locked'):
+                        current, _ = self.guard(self.snapshot(), pane_id)
+                        require(current['terminal_id'] == row['terminal_id'], 'scope_mismatch',
+                                'Pane terminal changed before marking closure')
+                        return self.defer_close(current, reason)
+                    if reason in ('unknown_method', 'method_not_found', 'invalid_request'):
+                        current, _ = self.guard(self.snapshot(), pane_id)
+                        require(current['terminal_id'] == row['terminal_id'], 'scope_mismatch',
+                                'Pane terminal changed before marking closure')
+                        return self.defer_close(current, 'guarded_close_unavailable')
+                    raise
+            else:
+                self.rpc('pane.close', changes=True, pane_id=pane_id)
+            return self.confirm_close(pane_id)
+
+    def confirm_close(self, pane_id):
         try:
             snap = self.snapshot()
             require(not any(p.get('pane_id') == pane_id for p in snap['panes']), 'outcome_unknown', 'Pane remains present')
@@ -583,6 +671,14 @@ class Manager:
         _, locked = self.guard(self.snapshot(), pane_id)
         return dict(pane_id=pane_id, user_locked=locked)
 
+    def process_info(self, pane_id):
+        row = self.pane(self.snapshot(), pane_id)
+        result = obj(self.rpc('pane.process_info', pane_id=pane_id).get('process_info'))
+        require(result.get('pane_id') == pane_id
+                and self.pane(self.snapshot(), pane_id).get('terminal_id') == row.get('terminal_id'),
+                'scope_mismatch', 'Process information could not be bound to this terminal')
+        return dict(result, terminal_id=row['terminal_id'])
+
     def layout(self):
         snap = self.snapshot()
         tabs = []
@@ -591,7 +687,9 @@ class Manager:
             view = self.view(snap, tab_id)
             geometry = {row.get('pane_id'): row.get('rect') for row in objects(view.get('panes'))}
             panes = [dict(pane_id=p['pane_id'], label=p.get('label'), focused=p.get('focused') is True,
-                          user_locked=self.locked(view, p['pane_id']), rect=geometry.get(p['pane_id']))
+                          user_locked=self.locked(view, p['pane_id']), rect=geometry.get(p['pane_id']),
+                          terminal_id=p.get('terminal_id'),
+                          agent_status=p.get('agent_status'), **self.label_parts(p))
                      for p in snap['panes'] if p.get('tab_id') == tab_id]
             tabs.append(dict(tab_id=tab_id, label=tab.get('label'), zoomed=view['zoomed'],
                              area=view.get('area'), panes=panes))
@@ -637,7 +735,7 @@ def write_output(path, contents):
 def parser():
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = p.add_subparsers(dest='operation', required=True)
-    for op in ('workspaces', 'workspace-create', 'create', 'send', 'read', 'rename', 'lock-status', 'close', 'layout'):
+    for op in ('workspaces', 'workspace-create', 'create', 'send', 'read', 'rename', 'lock-status', 'process-info', 'close', 'layout'):
         sub = commands.add_parser(op, allow_abbrev=False)
         sub.add_argument('--instance', required=True, help='explicit local Herdr session name')
         if op == 'workspaces':
@@ -646,6 +744,7 @@ def parser():
             sub.add_argument('--label', required=True)
             sub.add_argument('--cwd', required=True)
             sub.add_argument('--focus', action='store_true')
+            sub.add_argument('--group', help='Allow the initial shell to share this managed group')
             continue
         sub.add_argument('--workspace', required=True, help='exact Herdr workspace ID, not a label')
         if op not in ('create', 'layout'):
@@ -659,7 +758,12 @@ def parser():
             sub.add_argument('--cwd', required=True)
             sub.add_argument('--group', required=True)
         if op in ('create', 'rename'):
-            sub.add_argument('--suffix', required=True)
+            sub.add_argument('--suffix')
+            sub.add_argument('--status')
+            sub.add_argument('--comment')
+        if op == 'close':
+            sub.add_argument('--defer-locked', action='store_true',
+                             help='Require a native zoom precondition and mark deferred closure')
         if op == 'send':
             text = sub.add_mutually_exclusive_group(required=True)
             text.add_argument('--text')
@@ -686,7 +790,7 @@ def main():
             print(json_text(dict(ok=True, result=result)))
             return 0
         if a.operation == 'workspace-create':
-            result = workspace_create(transport, a.label, a.cwd, a.focus)
+            result = workspace_create(transport, a.label, a.cwd, a.focus, group=a.group)
             print(json_text(dict(ok=True, result=result)))
             return 0
         manager = Manager(transport, a.workspace)
@@ -708,14 +812,19 @@ def main():
                 except (ValueError, UnicodeError) as e:
                     raise Failure('invalid_argument', 'Expected a UTF-8 JSON argument array') from e
             require(a.command is not None or argv is not None, 'invalid_argument', 'Expected a JSON argument array')
-            result = manager.create(a.command, a.cwd, a.group, a.suffix, argv, limits=limits)
+            result = manager.create(a.command, a.cwd, a.group, a.suffix, argv, limits=limits,
+                                    status=a.status, comment=a.comment)
         elif a.operation == 'send':
             text = sys.stdin.buffer.read(65537).decode('utf-8') if a.stdin else a.text
             result = manager.send(a.pane, text)
         elif a.operation == 'read':
             result = manager.read(a.pane, a.source, a.limit, a.before)
         elif a.operation == 'rename':
-            result = manager.rename(a.pane, a.suffix)
+            require(any(value is not None for value in (a.suffix, a.status, a.comment)),
+                    'invalid_argument', 'Supply a suffix, status, or comment')
+            result = manager.rename(a.pane, a.suffix, status=a.status, comment=a.comment)
+        elif a.operation == 'close':
+            result = manager.close(a.pane, defer_locked=a.defer_locked)
         else:
             result = getattr(manager, a.operation.replace('-', '_'))(a.pane)
         print(json_text(dict(ok=True, result=result)))

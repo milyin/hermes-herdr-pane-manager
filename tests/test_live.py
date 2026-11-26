@@ -299,6 +299,32 @@ sys.exit(9)
         self.call('close', '--pane', first)
         self.call('lock-status', '--pane', first, code='pane_not_found')
 
+    def test_structured_label_and_safe_deferred_close(self):
+        created = self.call('create', '--argv', json.dumps([sys.executable, '-u', '-c', ECHO]),
+                            '--cwd', str(self.cwd), '--group', 'reports', '--status', 'I:UNREAD',
+                            '--comment', '#42:#27')
+        pane = created['pane_id']
+        other = self.create('sibling', group='reports')
+        renamed = self.call('rename', '--pane', pane, '--status', 'I:READ')
+        self.assertEqual(renamed['comment'], '#42:#27')
+        self.native(PRIMARY, 'pane', 'zoom', other, '--on')
+        deferred = self.call('close', '--pane', pane, '--defer-locked')
+        self.assertEqual(deferred['status_code'], 'close_deferred')
+        self.assertEqual(deferred['reason'], 'tab_user_locked')
+        self.assertEqual(deferred['displayed_id'], f'{pane}:DEAD')
+        self.assertEqual(deferred['status'], 'I:READ')
+        self.native(PRIMARY, 'pane', 'zoom', other, '--off')
+        cleared = self.call('rename', '--pane', pane, '--comment', '')
+        self.assertEqual(cleared['label'], f'{pane}:DEAD I:READ')
+        self.assertTrue(cleared['pending_closure'])
+        info = self.call('process-info', '--pane', pane)
+        self.assertEqual(info['pane_id'], pane)
+        if os.name != 'nt':
+            self.assertTrue(info['terminal_id'])
+        retried = self.call('close', '--pane', pane, '--defer-locked')
+        if not retried['closed']:
+            self.assertEqual(retried['reason'], 'guarded_close_unavailable')
+            self.assertEqual(retried['displayed_id'], f'{pane}:DEAD')
     def test_scope_paging_and_renderers(self):
         pane = self.create('<script>bad</script>', group='formats', argv=[sys.executable, '-u', '-c',
                            'import sys; print("first\\nlast", flush=True); sys.stdin.read()'])
