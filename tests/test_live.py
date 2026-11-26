@@ -322,9 +322,10 @@ sys.exit(9)
         if os.name != 'nt':
             self.assertTrue(info['terminal_id'])
         retried = self.call('close', '--pane', pane, '--defer-locked')
-        if not retried['closed']:
-            self.assertEqual(retried['reason'], 'guarded_close_unavailable')
-            self.assertEqual(retried['displayed_id'], f'{pane}:DEAD')
+        self.assertTrue(retried['closed'], retried)
+        self.call('lock-status', '--pane', pane, code='pane_not_found')
+        self.assertFalse(self.call('lock-status', '--pane', other)['user_locked'])
+
     def test_scope_paging_and_renderers(self):
         pane = self.create('<script>bad</script>', group='formats', argv=[sys.executable, '-u', '-c',
                            'import sys; print("first\\nlast", flush=True); sys.stdin.read()'])

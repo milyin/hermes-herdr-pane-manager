@@ -614,25 +614,7 @@ class Manager:
                 if defer_locked:
                     return self.defer_close(row, reason)
                 raise Failure(reason, 'Closing this pane would disturb a zoomed pane')
-            if defer_locked:
-                try:
-                    self.rpc('pane.close_unzoomed', changes=True, pane_id=pane_id,
-                             terminal_id=row['terminal_id'], workspace_id=self.workspace)
-                except Failure as exc:
-                    reason = exc.data.get('native_code')
-                    if reason in ('user_locked', 'tab_user_locked'):
-                        current, _ = self.guard(self.snapshot(), pane_id)
-                        require(current['terminal_id'] == row['terminal_id'], 'scope_mismatch',
-                                'Pane terminal changed before marking closure')
-                        return self.defer_close(current, reason)
-                    if reason in ('unknown_method', 'method_not_found', 'invalid_request'):
-                        current, _ = self.guard(self.snapshot(), pane_id)
-                        require(current['terminal_id'] == row['terminal_id'], 'scope_mismatch',
-                                'Pane terminal changed before marking closure')
-                        return self.defer_close(current, 'guarded_close_unavailable')
-                    raise
-            else:
-                self.rpc('pane.close', changes=True, pane_id=pane_id)
+            self.rpc('pane.close', changes=True, pane_id=pane_id)
             return self.confirm_close(pane_id)
 
     def confirm_close(self, pane_id):
